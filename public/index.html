@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="sr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Coup Online - Colyseus</title>
+  <script src="https://unpkg.com/colyseus.js@^0.15.0/dist/colyseus.js"></script>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: #121212;
+      color: #f0f0f0;
+      margin: 0;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 { color: #f5c518; margin-bottom: 5px; }
+    .container { max-width: 900px; width: 100%; }
+    .box {
+      background: #1e1e1e;
+      border: 1px solid #333;
+      border-radius: 10px;
+      padding: 15px;
+      margin-bottom: 15px;
+    }
+    button {
+      background: #2c3e50;
+      color: white;
+      border: none;
+      padding: 10px 14px;
+      margin: 4px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-weight: bold;
+      transition: 0.2s;
+    }
+    button:hover:not(:disabled) { background: #3498db; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn-danger { background: #c0392b; }
+    .btn-danger:hover:not(:disabled) { background: #e74c3c; }
+    .btn-success { background: #27ae60; }
+    .btn-success:hover:not(:disabled) { background: #2ecc71; }
+    input, select {
+      padding: 10px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #2b2b2b;
+      color: white;
+      margin-right: 8px;
+    }
+    .players-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .player-card {
+      background: #252525;
+      border: 2px solid #333;
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .player-card.active-turn { border-color: #f5c518; }
+    .player-card.dead { opacity: 0.45; }
+    .card-badge {
+      display: inline-block;
+      padding: 6px 10px;
+      margin: 4px 4px 0 0;
+      border-radius: 5px;
+      font-size: 0.9em;
+      font-weight: bold;
+    }
+    .card-secret { background: #34495e; color: #ecf0f1; }
+    .card-hidden { background: #444; color: #aaa; }
+    .card-revealed { background: #7f1d1d; color: #fca5a5; text-decoration: line-through; }
+    #logs {
+      height: 160px;
+      overflow-y: auto;
+      background: #141414;
+      padding: 10px;
+      border-radius: 6px;
+      font-family: monospace;
+      font-size: 0.9em;
+      border: 1px solid #2c2c2c;
+    }
+    .log-entry { margin-bottom: 4px; border-bottom: 1px solid #222; padding-bottom: 2px; }
+    .rules-table { width: 100%; border-collapse: collapse; font-size: 0.85em; margin-top: 10px; }
+    .rules-table th, .rules-table td { border: 1px solid #333; padding: 6px; text-align: left; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>👑 COUP Multiplayer</h1>
+
+    <!-- LOGIN EKRAN -->
+    <div id="join-screen" class="box">
+      <input type="text" id="player-name" placeholder="Tvoje ime..." maxlength="15" />
+      <button class="btn-success" onclick="joinGame()">Uđi u sobu</button>
+    </div>
+
+    <!-- GLAVNI EKRAN IGRE -->
+    <div id="game-screen" style="display:none;">
+      <div class="box" style="display:flex; justify-content:space-between; align-items:center;">
+        <div>
+          <strong>Faza:</strong> <span id="phase-text">-</span> |
+          <strong>Na potezu:</strong> <span id="turn-text" style="color:#f5c518;">-</span>
+        </div>
+        <button id="start-btn" class="btn-success" onclick="send('start_game')">Započni igru</button>
+      </div>
+
+      <!-- IGRAČI -->
+      <div id="players-container" class="players-grid"></div>
+
+      <!-- KONTROLE ZA AKCIJE -->
+      <div id="controls-box" class="box" style="margin-top:15px;">
+        <div id="action-controls" style="display:none;">
+          <h3>Tvoj potez — izaberi akciju:</h3>
+          <div style="margin-bottom:8px;">
+            <label>Meta (za Coup, Assassinate, Steal): </label>
+            <select id="target-select"></select>
+          </div>
+          <button onclick="doAction('INCOME')">Income (+1)</button>
+          <button onclick="doAction('FOREIGN_AID')">Foreign Aid (+2)</button>
+          <button class="btn-danger" onclick="doAction('COUP')">Coup (-7)</button>
+          <button onclick="doAction('TAX')">Duke: Tax (+3)</button>
+          <button class="btn-danger" onclick="doAction('ASSASSINATE')">Assassin: Assassinate (-3)</button>
+          <button onclick="doAction('STEAL')">Captain: Steal (+2)</button>
+          <button onclick="doAction('EXCHANGE')">Ambassador: Exchange</button>
+        </div>
+
+        <div id="response-controls" style="display:none;">
+          <h3 id="response-prompt">Reakcija na potez:</h3>
+          <button class="btn-success" onclick="send('pass')">Dozvoli (Pass)</button>
+          <button class="btn-danger" onclick="send('challenge')">Izazovi ("Lažeš!")</button>
+          <span id="block-buttons"></span>
+        </div>
+
+        <div id="lose-controls" style="display:none;">
+          <h3>Izgubio si uticaj! Izaberi kartu koju otkrivaš:</h3>
+          <div id="lose-buttons"></div>
+        </div>
+
+        <div id="exchange-controls" style="display:none;">
+          <h3>Ambassador zamena — klikni na karte koje želiš da ZADRŽIŠ:</h3>
+          <div id="exchange-buttons"></div>
+        </div>
+
+        <div id="gameover-controls" style="display:none;">
+          <h2 id="winner-banner" style="color:#f5c518;"></h2>
+          <button class="btn-success" onclick="send('start_game')">Igraj ponovo</button>
+        </div>
+      </div>
+
+      <!-- LOGOVI -->
+      <div class="box">
+        <strong>Tok igre:</strong>
+        <div id="logs"></div>
+      </div>
+
+      <!-- BRZI PODSETNIK PRAVILA -->
+      <div class="box">
+        <strong>Brzi podsetnik uloga:</strong>
+        <table class="rules-table">
+          <tr><th>Uloga</th><th>Akcija</th><th>Blokira</th></tr>
+          <tr><td>Duke</td><td>Tax (+3 novčića)</td><td>Foreign Aid</td></tr>
+          <tr><td>Assassin</td><td>Assassinate (plati 3, ubij kartu)</td><td>-</td></tr>
+          <tr><td>Captain</td><td>Steal (ukradi 2 novčića)</td><td>Steal</td></tr>
+          <tr><td>Ambassador</td><td>Exchange (zameni karte sa špilom)</td><td>Steal</td></tr>
+          <tr><td>Contessa</td><td>-</td><td>Assassinate</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let client;
+    let room;
+    let myId = "";
+    let exchangeOptions = [];
+    let selectedExchangeIndices = [];
+
+    async function joinGame() {
+      const name = document.getElementById("player-name").value.trim() || "Igrač";
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      const endpoint = `${protocol}://${window.location.host}`;
+
+      client = new Colyseus.Client(endpoint);
+      try {
+        room = await client.joinOrCreate("coup_room", { name });
+        myId = room.sessionId;
+
+        document.getElementById("join-screen").style.display = "none";
+        document.getElementById("game-screen").style.display = "block";
+
+        room.onStateChange((state) => render(state));
+
+        room.onMessage("exchange_options", (data) => {
+          exchangeOptions = data.cards;
+          selectedExchangeIndices = [];
+          renderExchange();
+        });
+      } catch (e) {
+        alert("Greška pri ulasku u sobu: " + e.message);
+      }
+    }
+
+    function send(type, payload = {}) {
+      if (room) room.send(type, payload);
+    }
+
+    function doAction(type) {
+      const targetId = document.getElementById("target-select").value;
+      send("action", { type, targetId });
+    }
+
+    function render(state) {
+      document.getElementById("phase-text").innerText = state.phase;
+      const turnPlayer = state.players.get(state.turnPlayerId);
+      document.getElementById("turn-text").innerText = turnPlayer ? turnPlayer.name : "-";
+
+      document.getElementById("start-btn").style.display = state.phase === "LOBBY" ? "inline-block" : "none";
+
+      const container = document.getElementById("players-container");
+      const targetSelect = document.getElementById("target-select");
+      const prevTarget = targetSelect.value;
+      container.innerHTML = "";
+      targetSelect.innerHTML = "";
+
+      state.players.forEach((p, id) => {
+        if (id !== myId && p.alive) {
+          const opt = document.createElement("option");
+          opt.value = id;
+          opt.innerText = `${p.name} (${p.coins} 💰)`;
+          targetSelect.appendChild(opt);
+        }
+
+        const div = document.createElement("div");
+        div.className = "player-card" + (id === state.turnPlayerId ? " active-turn" : "") + (!p.alive ? " dead" : "");
+
+        let cardsHtml = "";
+        p.cards.forEach((c) => {
+          if (c.revealed) {
+            cardsHtml += `<span class="card-badge card-revealed">💀 ${c.role}</span>`;
+          } else if (id === myId) {
+            cardsHtml += `<span class="card-badge card-secret">🃏 ${c.role}</span>`;
+          } else {
+            cardsHtml += `<span class="card-badge card-hidden">🂠 Tajna</span>`;
+          }
+        });
+
+        div.innerHTML = `
+          <div><strong>${p.name}</strong> ${id === myId ? "(Ti)" : ""}</div>
+          <div style="margin: 5px 0;">💰 Novčići: <strong>${p.coins}</strong></div>
+          <div>${cardsHtml}</div>
+        `;
+        container.appendChild(div);
+      });
+
+      if (prevTarget) targetSelect.value = prevTarget;
+
+      ["action-controls", "response-controls", "lose-controls", "exchange-controls", "gameover-controls"].forEach(id => {
+        document.getElementById(id).style.display = "none";
+      });
+
+      const me = state.players.get(myId);
+
+      if (state.phase === "ACTION" && state.turnPlayerId === myId) {
+        document.getElementById("action-controls").style.display = "block";
+      }
+
+      if (state.phase === "RESPONSE" && me && me.alive) {
+        const activeClaimant = state.blockerId || state.actorId;
+        if (myId !== activeClaimant) {
+          document.getElementById("response-controls").style.display = "block";
+          const actor = state.players.get(state.actorId);
+          const blocker = state.blockerId ? state.players.get(state.blockerId) : null;
+
+          if (blocker) {
+            document.getElementById("response-prompt").innerText =
+              `${blocker.name} blokira kao ${state.blockedRole}. Izazivaš ili dozvoljavaš?`;
+            document.getElementById("block-buttons").innerHTML = "";
+          } else {
+            document.getElementById("response-prompt").innerText =
+              `${actor.name} igra ${state.pendingAction}` + (state.claimedRole ? ` (${state.claimedRole})` : "");
+            document.querySelector("#response-controls .btn-danger").style.display =
+              state.claimedRole ? "inline-block" : "none";
+
+            let blockHtml = "";
+            if (state.pendingAction === "FOREIGN_AID") {
+              blockHtml += `<button onclick="send('block', {role:'Duke'})">Blokiraj (Duke)</button>`;
+            }
+            if (state.pendingAction === "ASSASSINATE" && state.targetId === myId) {
+              blockHtml += `<button onclick="send('block', {role:'Contessa'})">Blokiraj (Contessa)</button>`;
+            }
+            if (state.pendingAction === "STEAL" && state.targetId === myId) {
+              blockHtml += `<button onclick="send('block', {role:'Captain'})">Blokiraj (Captain)</button>`;
+              blockHtml += `<button onclick="send('block', {role:'Ambassador'})">Blokiraj (Ambassador)</button>`;
+            }
+            document.getElementById("block-buttons").innerHTML = blockHtml;
+          }
+        }
+      }
+
+      if (state.phase === "LOSE_INFLUENCE" && state.loserPlayerId === myId && me) {
+        document.getElementById("lose-controls").style.display = "block";
+        const loseDiv = document.getElementById("lose-buttons");
+        loseDiv.innerHTML = "";
+        me.cards.forEach((c, idx) => {
+          if (!c.revealed) {
+            const btn = document.createElement("button");
+            btn.className = "btn-danger";
+            btn.innerText = `Izgubi: ${c.role}`;
+            btn.onclick = () => send("lose_card", { cardIndex: idx });
+            loseDiv.appendChild(btn);
+          }
+        });
+      }
+
+      if (state.phase === "EXCHANGE" && state.actorId === myId) {
+        document.getElementById("exchange-controls").style.display = "block";
+      }
+
+      if (state.phase === "GAME_OVER") {
+        document.getElementById("gameover-controls").style.display = "block";
+        document.getElementById("winner-banner").innerText = `🏆 Pobednik je ${state.winnerName}!`;
+      }
+
+      const logsDiv = document.getElementById("logs");
+      logsDiv.innerHTML = state.logs.map(l => `<div class="log-entry">> ${l}</div>`).join("");
+      logsDiv.scrollTop = logsDiv.scrollHeight;
+    }
+
+    function renderExchange() {
+      const me = room.state.players.get(myId);
+      const needed = me.cards.filter(c => !c.revealed).length;
+      const div = document.getElementById("exchange-buttons");
+      div.innerHTML = `<p>Izaberi tačno <strong>${needed}</strong> karte:</p>`;
+
+      exchangeOptions.forEach((role, idx) => {
+        const isSelected = selectedExchangeIndices.includes(idx);
+        const btn = document.createElement("button");
+        btn.className = isSelected ? "btn-success" : "";
+        btn.innerText = (isSelected ? "✅ " : "") + role;
+        btn.onclick = () => {
+          if (isSelected) {
+            selectedExchangeIndices = selectedExchangeIndices.filter(i => i !== idx);
+          } else if (selectedExchangeIndices.length < needed) {
+            selectedExchangeIndices.push(idx);
+          }
+          renderExchange();
+        };
+        div.appendChild(btn);
+      });
+
+      if (selectedExchangeIndices.length === needed) {
+        const confirmBtn = document.createElement("button");
+        confirmBtn.className = "btn-success";
+        confirmBtn.innerText = "Potvrdi izbor";
+        confirmBtn.onclick = () => send("exchange_select", { keepIndices: selectedExchangeIndices });
+        div.appendChild(confirmBtn);
+      }
+    }
+  </script>
+</body>
+</html>
