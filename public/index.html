@@ -213,7 +213,7 @@
 
     function doAction(type) {
       const targetId = document.getElementById("target-select").value;
-      send("action", { type, targetId });
+      send("action", { actionType: type, targetId });
     }
 
     function render(state) {

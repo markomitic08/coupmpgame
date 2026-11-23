@@ -1,16 +1,14 @@
 const http = require("http");
 const express = require("express");
 const path = require("path");
-const { WebSocketServer } = require("ws");
-const { Server, Room } = require("colyseus");
-const { WebSocketTransport } = require("@colyseus/ws-transport");
+const WebSocket = require("ws");
 
 class GameEngine {
   constructor(broadcastFn, sendToFn) {
     this.broadcast = broadcastFn;
     this.sendTo = sendToFn;
     this.players = {};
-    this.phase = "LOBBY";
+    this.phase = "LOBBY"; // LOBBY, ACTION, RESPONSE, LOSE_INFLUENCE, EXCHANGE, GAME_OVER
     this.turnPlayerId = "";
     this.logs = [];
     this.pendingAction = "";
@@ -29,7 +27,7 @@ class GameEngine {
 
   addLog(msg) {
     this.logs.push(msg);
-    if (this.logs.length > 25) this.logs.shift();
+    if (this.logs.length > 30) this.logs.shift();
   }
 
   addPlayer(id, name) {
@@ -101,18 +99,16 @@ class GameEngine {
   }
 
   handleMessage(clientId, msg) {
-    if (msg.type === "start_game" && this.phase === "LOBBY") {
-      this.startGame();
-      return;
-    }
-    if (msg.type === "start_game" && this.phase === "GAME_OVER") {
+    if (!msg || !msg.type) return;
+
+    if (msg.type === "start_game" && (this.phase === "LOBBY" || this.phase === "GAME_OVER")) {
       this.startGame();
       return;
     }
 
     if (msg.type === "action") {
       if (this.phase !== "ACTION" || clientId !== this.turnPlayerId) return;
-      this.handleAction(clientId, msg.type === "action" ? msg.targetId : null, msg);
+      this.handleAction(clientId, msg.actionType, msg.targetId);
     } else if (msg.type === "pass") {
       if (this.phase !== "RESPONSE") return;
       const p = this.players[clientId];
@@ -138,10 +134,7 @@ class GameEngine {
     }
   }
 
-  handleAction(actorId, _unused, msg) {
-    const type = msg.type === "action" ? (msg.actionType || msg.payload?.type || msg.type) : msg.type;
-    const actionType = msg.type === "action" ? (arguments[2]?.type || msg.type) : type;
-    const targetId = arguments[2]?.targetId || msg.targetId;
+  handleAction(actorId, actionType, targetId) {
     const actor = this.players[actorId];
     const target = targetId ? this.players[targetId] : null;
 
@@ -188,6 +181,7 @@ class GameEngine {
       this.addLog(`${actor.name} tvrdi da je Ambassador i menja karte.`);
       this.enterResponsePhase();
     }
+
     this.broadcastState();
   }
 
@@ -214,6 +208,7 @@ class GameEngine {
   handleBlock(blockerId, role) {
     const blocker = this.players[blockerId];
     const action = this.pendingAction;
+
     if (action === "FOREIGN_AID" && role === "Duke") {
       this.blockerId = blockerId;
       this.blockedRole = "Duke";
@@ -230,6 +225,7 @@ class GameEngine {
       this.addLog(`${blocker.name} blokira krađu kao ${role}!`);
       this.enterResponsePhase();
     }
+
     this.broadcastState();
   }
 
@@ -255,6 +251,7 @@ class GameEngine {
       const nextStep = isBlockerChallenged ? "RESOLVE_ACTION" : "NEXT_TURN";
       this.triggerLoseInfluence(accusedId, nextStep);
     }
+
     this.broadcastState();
   }
 
@@ -433,21 +430,21 @@ const app = express();
 app.use(express.static(path.join(__dirname, "public")));
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true });
+const wss = new WebSocket.Server({ noServer: true });
 const sockets = new Map();
 let nextClientId = 1;
 
 const engine = new GameEngine(
   () => {
     for (const [id, socket] of sockets.entries()) {
-      if (socket.readyState === 1) {
+      if (socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "state", state: engine.getSanitizedState(id) }));
       }
     }
   },
   (targetId, payload) => {
     const socket = sockets.get(targetId);
-    if (socket && socket.readyState === 1) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(payload));
     }
   }
