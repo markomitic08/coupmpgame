@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Coup Online - Colyseus</title>
-  <script src="https://unpkg.com/colyseus.js@^0.15.0/dist/colyseus.js"></script>
+  <link rel="icon" href="data:," />
+  <title>Coup Online</title>
   <style>
     body {
       font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -93,13 +93,11 @@
   <div class="container">
     <h1>👑 COUP Multiplayer</h1>
 
-    <!-- LOGIN EKRAN -->
     <div id="join-screen" class="box">
       <input type="text" id="player-name" placeholder="Tvoje ime..." maxlength="15" />
       <button class="btn-success" onclick="joinGame()">Uđi u sobu</button>
     </div>
 
-    <!-- GLAVNI EKRAN IGRE -->
     <div id="game-screen" style="display:none;">
       <div class="box" style="display:flex; justify-content:space-between; align-items:center;">
         <div>
@@ -109,10 +107,8 @@
         <button id="start-btn" class="btn-success" onclick="send('start_game')">Započni igru</button>
       </div>
 
-      <!-- IGRAČI -->
       <div id="players-container" class="players-grid"></div>
 
-      <!-- KONTROLE ZA AKCIJE -->
       <div id="controls-box" class="box" style="margin-top:15px;">
         <div id="action-controls" style="display:none;">
           <h3>Tvoj potez — izaberi akciju:</h3>
@@ -152,13 +148,11 @@
         </div>
       </div>
 
-      <!-- LOGOVI -->
       <div class="box">
         <strong>Tok igre:</strong>
         <div id="logs"></div>
       </div>
 
-      <!-- BRZI PODSETNIK PRAVILA -->
       <div class="box">
         <strong>Brzi podsetnik uloga:</strong>
         <table class="rules-table">
@@ -174,39 +168,47 @@
   </div>
 
   <script>
-    let client;
-    let room;
+    let ws;
     let myId = "";
+    let currentState = null;
     let exchangeOptions = [];
     let selectedExchangeIndices = [];
 
-    async function joinGame() {
+    function joinGame() {
       const name = document.getElementById("player-name").value.trim() || "Igrač";
       const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      const endpoint = `${protocol}://${window.location.host}`;
+      const url = `${protocol}://${window.location.host}/ws?name=${encodeURIComponent(name)}`;
 
-      client = new Colyseus.Client(endpoint);
-      try {
-        room = await client.joinOrCreate("coup_room", { name });
-        myId = room.sessionId;
+      ws = new WebSocket(url);
 
+      ws.onopen = () => {
         document.getElementById("join-screen").style.display = "none";
         document.getElementById("game-screen").style.display = "block";
+      };
 
-        room.onStateChange((state) => render(state));
-
-        room.onMessage("exchange_options", (data) => {
-          exchangeOptions = data.cards;
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "welcome") {
+          myId = msg.id;
+        } else if (msg.type === "state") {
+          currentState = msg.state;
+          render(currentState);
+        } else if (msg.type === "exchange_options") {
+          exchangeOptions = msg.cards;
           selectedExchangeIndices = [];
           renderExchange();
-        });
-      } catch (e) {
-        alert("Greška pri ulasku u sobu: " + e.message);
-      }
+        }
+      };
+
+      ws.onerror = () => {
+        alert("Greška pri povezivanju sa serverom.");
+      };
     }
 
     function send(type, payload = {}) {
-      if (room) room.send(type, payload);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type, ...payload }));
+      }
     }
 
     function doAction(type) {
@@ -216,7 +218,8 @@
 
     function render(state) {
       document.getElementById("phase-text").innerText = state.phase;
-      const turnPlayer = state.players.get(state.turnPlayerId);
+      const playersArr = Object.entries(state.players);
+      const turnPlayer = state.players[state.turnPlayerId];
       document.getElementById("turn-text").innerText = turnPlayer ? turnPlayer.name : "-";
 
       document.getElementById("start-btn").style.display = state.phase === "LOBBY" ? "inline-block" : "none";
@@ -227,7 +230,7 @@
       container.innerHTML = "";
       targetSelect.innerHTML = "";
 
-      state.players.forEach((p, id) => {
+      playersArr.forEach(([id, p]) => {
         if (id !== myId && p.alive) {
           const opt = document.createElement("option");
           opt.value = id;
@@ -263,7 +266,7 @@
         document.getElementById(id).style.display = "none";
       });
 
-      const me = state.players.get(myId);
+      const me = state.players[myId];
 
       if (state.phase === "ACTION" && state.turnPlayerId === myId) {
         document.getElementById("action-controls").style.display = "block";
@@ -273,8 +276,8 @@
         const activeClaimant = state.blockerId || state.actorId;
         if (myId !== activeClaimant) {
           document.getElementById("response-controls").style.display = "block";
-          const actor = state.players.get(state.actorId);
-          const blocker = state.blockerId ? state.players.get(state.blockerId) : null;
+          const actor = state.players[state.actorId];
+          const blocker = state.blockerId ? state.players[state.blockerId] : null;
 
           if (blocker) {
             document.getElementById("response-prompt").innerText =
@@ -332,7 +335,7 @@
     }
 
     function renderExchange() {
-      const me = room.state.players.get(myId);
+      const me = currentState.players[myId];
       const needed = me.cards.filter(c => !c.revealed).length;
       const div = document.getElementById("exchange-buttons");
       div.innerHTML = `<p>Izaberi tačno <strong>${needed}</strong> karte:</p>`;

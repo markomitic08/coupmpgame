@@ -1,49 +1,18 @@
 const http = require("http");
 const express = require("express");
 const path = require("path");
+const { WebSocketServer } = require("ws");
 const { Server, Room } = require("colyseus");
-const { Schema, MapSchema, ArraySchema, defineTypes } = require("@colyseus/schema");
+const { WebSocketTransport } = require("@colyseus/ws-transport");
 
-// --- DEFINICIJA STANJA (STATE) ---
-class Card extends Schema {
-  constructor(role, revealed = false) {
-    super();
-    this.role = role;
-    this.revealed = revealed;
-  }
-}
-defineTypes(Card, {
-  role: "string",
-  revealed: "boolean"
-});
-
-class Player extends Schema {
-  constructor(id, name) {
-    super();
-    this.id = id;
-    this.name = name;
-    this.coins = 2;
-    this.alive = true;
-    this.cards = new ArraySchema();
-  }
-}
-defineTypes(Player, {
-  id: "string",
-  name: "string",
-  coins: "number",
-  alive: "boolean",
-  cards: [Card]
-});
-
-class CoupState extends Schema {
-  constructor() {
-    super();
-    this.players = new MapSchema();
-    this.phase = "LOBBY"; // LOBBY, ACTION, RESPONSE, LOSE_INFLUENCE, EXCHANGE, GAME_OVER
+class GameEngine {
+  constructor(broadcastFn, sendToFn) {
+    this.broadcast = broadcastFn;
+    this.sendTo = sendToFn;
+    this.players = {};
+    this.phase = "LOBBY";
     this.turnPlayerId = "";
-    this.logs = new ArraySchema();
-    
-    // Trenutna akcija na stolu
+    this.logs = [];
     this.pendingAction = "";
     this.actorId = "";
     this.targetId = "";
@@ -53,107 +22,42 @@ class CoupState extends Schema {
     this.loserPlayerId = "";
     this.loserReason = "";
     this.winnerName = "";
-  }
-}
-defineTypes(CoupState, {
-  players: { map: Player },
-  phase: "string",
-  turnPlayerId: "string",
-  logs: ["string"],
-  pendingAction: "string",
-  actorId: "string",
-  targetId: "string",
-  claimedRole: "string",
-  blockerId: "string",
-  blockedRole: "string",
-  loserPlayerId: "string",
-  loserReason: "string",
-  winnerName: "string"
-});
-
-// --- SOBA ZA IGRU ---
-class CoupRoom extends Room {
-  onCreate() {
-    this.setState(new CoupState());
     this.deck = [];
     this.passedPlayers = new Set();
     this.exchangePool = [];
-
-    this.onMessage("start_game", (client) => {
-      if (this.state.phase !== "LOBBY") return;
-      if (this.state.players.size < 2) {
-        this.addLog("Potrebna su bar 2 igrača za početak!");
-        return;
-      }
-      this.startGame();
-    });
-
-    this.onMessage("action", (client, data) => {
-      if (this.state.phase !== "ACTION" || client.sessionId !== this.state.turnPlayerId) return;
-      this.handleAction(client.sessionId, data.type, data.targetId);
-    });
-
-    this.onMessage("pass", (client) => {
-      if (this.state.phase !== "RESPONSE") return;
-      const p = this.state.players.get(client.sessionId);
-      if (!p || !p.alive) return;
-
-      this.passedPlayers.add(client.sessionId);
-      this.checkAllPassed();
-    });
-
-    this.onMessage("challenge", (client) => {
-      if (this.state.phase !== "RESPONSE") return;
-      const challenger = this.state.players.get(client.sessionId);
-      if (!challenger || !challenger.alive) return;
-      this.handleChallenge(client.sessionId);
-    });
-
-    this.onMessage("block", (client, data) => {
-      if (this.state.phase !== "RESPONSE" || this.state.blockerId !== "") return;
-      const blocker = this.state.players.get(client.sessionId);
-      if (!blocker || !blocker.alive || client.sessionId === this.state.actorId) return;
-      this.handleBlock(client.sessionId, data.role);
-    });
-
-    this.onMessage("lose_card", (client, data) => {
-      if (this.state.phase !== "LOSE_INFLUENCE" || client.sessionId !== this.state.loserPlayerId) return;
-      this.handleLoseCard(client.sessionId, data.cardIndex);
-    });
-
-    this.onMessage("exchange_select", (client, data) => {
-      if (this.state.phase !== "EXCHANGE" || client.sessionId !== this.state.actorId) return;
-      this.handleExchangeSelect(client.sessionId, data.keepIndices);
-    });
-  }
-
-  onJoin(client, options) {
-    if (this.state.phase !== "LOBBY") {
-      throw new Error("Igra je već u toku!");
-    }
-    const name = (options.name || "Igrač").substring(0, 15);
-    const player = new Player(client.sessionId, name);
-    this.state.players.set(client.sessionId, player);
-    this.addLog(`${name} se pridružio sobi.`);
-  }
-
-  onLeave(client) {
-    const p = this.state.players.get(client.sessionId);
-    if (p) {
-      this.addLog(`${p.name} je napustio igru.`);
-      if (this.state.phase === "LOBBY") {
-        this.state.players.delete(client.sessionId);
-      } else {
-        p.alive = false;
-        p.cards.forEach(c => c.revealed = true);
-        this.checkWinCondition();
-      }
-    }
   }
 
   addLog(msg) {
-    this.state.logs.push(msg);
-    if (this.state.logs.length > 25) this.state.logs.shift();
+    this.logs.push(msg);
+    if (this.logs.length > 25) this.logs.shift();
+  }
+
+  addPlayer(id, name) {
+    if (this.phase !== "LOBBY") return false;
+    this.players[id] = {
+      id,
+      name: (name || "Igrač").substring(0, 15),
+      coins: 2,
+      alive: true,
+      cards: []
+    };
+    this.addLog(`${this.players[id].name} se pridružio sobi.`);
+    this.broadcastState();
+    return true;
+  }
+
+  removePlayer(id) {
+    const p = this.players[id];
+    if (!p) return;
+    this.addLog(`${p.name} je napustio igru.`);
+    if (this.phase === "LOBBY") {
+      delete this.players[id];
+    } else {
+      p.alive = false;
+      p.cards.forEach(c => (c.revealed = true));
+      this.checkWinCondition();
+    }
+    this.broadcastState();
   }
 
   initDeck() {
@@ -173,124 +77,170 @@ class CoupRoom extends Room {
   }
 
   startGame() {
+    const ids = Object.keys(this.players);
+    if (ids.length < 2) {
+      this.addLog("Potrebna su bar 2 igrača za početak!");
+      this.broadcastState();
+      return;
+    }
     this.initDeck();
-    const ids = Array.from(this.state.players.keys());
     ids.forEach(id => {
-      const p = this.state.players.get(id);
+      const p = this.players[id];
       p.coins = 2;
       p.alive = true;
-      p.cards.clear();
-      p.cards.push(new Card(this.deck.pop(), false));
-      p.cards.push(new Card(this.deck.pop(), false));
+      p.cards = [
+        { role: this.deck.pop(), revealed: false },
+        { role: this.deck.pop(), revealed: false }
+      ];
     });
-
-    this.state.turnPlayerId = ids[Math.floor(Math.random() * ids.length)];
-    this.state.phase = "ACTION";
+    this.turnPlayerId = ids[Math.floor(Math.random() * ids.length)];
+    this.phase = "ACTION";
+    this.winnerName = "";
     this.addLog("Igra je počela! Srećno blefiranje.");
+    this.broadcastState();
   }
 
-  handleAction(actorId, type, targetId) {
-    const actor = this.state.players.get(actorId);
-    const target = targetId ? this.state.players.get(targetId) : null;
+  handleMessage(clientId, msg) {
+    if (msg.type === "start_game" && this.phase === "LOBBY") {
+      this.startGame();
+      return;
+    }
+    if (msg.type === "start_game" && this.phase === "GAME_OVER") {
+      this.startGame();
+      return;
+    }
 
-    if (actor.coins >= 10 && type !== "COUP") {
+    if (msg.type === "action") {
+      if (this.phase !== "ACTION" || clientId !== this.turnPlayerId) return;
+      this.handleAction(clientId, msg.type === "action" ? msg.targetId : null, msg);
+    } else if (msg.type === "pass") {
+      if (this.phase !== "RESPONSE") return;
+      const p = this.players[clientId];
+      if (!p || !p.alive) return;
+      this.passedPlayers.add(clientId);
+      this.checkAllPassed();
+    } else if (msg.type === "challenge") {
+      if (this.phase !== "RESPONSE") return;
+      const c = this.players[clientId];
+      if (!c || !c.alive) return;
+      this.handleChallenge(clientId);
+    } else if (msg.type === "block") {
+      if (this.phase !== "RESPONSE" || this.blockerId !== "") return;
+      const b = this.players[clientId];
+      if (!b || !b.alive || clientId === this.actorId) return;
+      this.handleBlock(clientId, msg.role);
+    } else if (msg.type === "lose_card") {
+      if (this.phase !== "LOSE_INFLUENCE" || clientId !== this.loserPlayerId) return;
+      this.handleLoseCard(clientId, msg.cardIndex);
+    } else if (msg.type === "exchange_select") {
+      if (this.phase !== "EXCHANGE" || clientId !== this.actorId) return;
+      this.handleExchangeSelect(clientId, msg.keepIndices);
+    }
+  }
+
+  handleAction(actorId, _unused, msg) {
+    const type = msg.type === "action" ? (msg.actionType || msg.payload?.type || msg.type) : msg.type;
+    const actionType = msg.type === "action" ? (arguments[2]?.type || msg.type) : type;
+    const targetId = arguments[2]?.targetId || msg.targetId;
+    const actor = this.players[actorId];
+    const target = targetId ? this.players[targetId] : null;
+
+    if (actor.coins >= 10 && actionType !== "COUP") {
       this.addLog(`${actor.name} ima 10+ novčića i MORA da izvede Coup!`);
+      this.broadcastState();
       return;
     }
 
     this.resetPending();
-    this.state.actorId = actorId;
-    this.state.targetId = targetId || "";
-    this.state.pendingAction = type;
+    this.actorId = actorId;
+    this.targetId = targetId || "";
+    this.pendingAction = actionType;
 
-    if (type === "INCOME") {
+    if (actionType === "INCOME") {
       actor.coins += 1;
       this.addLog(`${actor.name} uzima Income (+1 novčić).`);
       this.nextTurn();
-    } else if (type === "FOREIGN_AID") {
+    } else if (actionType === "FOREIGN_AID") {
       this.addLog(`${actor.name} traži Foreign Aid (+2 novčića). Neko blokira (Duke)?`);
       this.enterResponsePhase();
-    } else if (type === "COUP") {
+    } else if (actionType === "COUP") {
       if (actor.coins < 7 || !target || !target.alive) return;
       actor.coins -= 7;
       this.addLog(`${actor.name} izvodi COUP na ${target.name}!`);
       this.triggerLoseInfluence(targetId, "NEXT_TURN");
-    } else if (type === "TAX") {
-      this.state.claimedRole = "Duke";
+    } else if (actionType === "TAX") {
+      this.claimedRole = "Duke";
       this.addLog(`${actor.name} tvrdi da je Duke i uzima Tax (+3 novčića).`);
       this.enterResponsePhase();
-    } else if (type === "ASSASSINATE") {
+    } else if (actionType === "ASSASSINATE") {
       if (actor.coins < 3 || !target || !target.alive) return;
       actor.coins -= 3;
-      this.state.claimedRole = "Assassin";
+      this.claimedRole = "Assassin";
       this.addLog(`${actor.name} tvrdi da je Assassin i napada ${target.name}!`);
       this.enterResponsePhase();
-    } else if (type === "STEAL") {
+    } else if (actionType === "STEAL") {
       if (!target || !target.alive) return;
-      this.state.claimedRole = "Captain";
+      this.claimedRole = "Captain";
       this.addLog(`${actor.name} tvrdi da je Captain i krade od ${target.name}.`);
       this.enterResponsePhase();
-    } else if (type === "EXCHANGE") {
-      this.state.claimedRole = "Ambassador";
+    } else if (actionType === "EXCHANGE") {
+      this.claimedRole = "Ambassador";
       this.addLog(`${actor.name} tvrdi da je Ambassador i menja karte.`);
       this.enterResponsePhase();
     }
+    this.broadcastState();
   }
 
   enterResponsePhase() {
-    this.state.phase = "RESPONSE";
+    this.phase = "RESPONSE";
     this.passedPlayers.clear();
-    const activeClaimant = this.state.blockerId || this.state.actorId;
+    const activeClaimant = this.blockerId || this.actorId;
     this.passedPlayers.add(activeClaimant);
   }
 
   checkAllPassed() {
-    let aliveCount = 0;
-    this.state.players.forEach((p, id) => {
-      if (p.alive) aliveCount++;
-    });
-
+    const aliveCount = Object.values(this.players).filter(p => p.alive).length;
     if (this.passedPlayers.size >= aliveCount) {
-      if (this.state.blockerId) {
+      if (this.blockerId) {
         this.addLog("Blokada je uspela! Akcija je poništena.");
         this.nextTurn();
       } else {
         this.resolveAction();
       }
     }
+    this.broadcastState();
   }
 
   handleBlock(blockerId, role) {
-    const blocker = this.state.players.get(blockerId);
-    const action = this.state.pendingAction;
-
+    const blocker = this.players[blockerId];
+    const action = this.pendingAction;
     if (action === "FOREIGN_AID" && role === "Duke") {
-      this.state.blockerId = blockerId;
-      this.state.blockedRole = "Duke";
+      this.blockerId = blockerId;
+      this.blockedRole = "Duke";
       this.addLog(`${blocker.name} blokira Foreign Aid kao Duke!`);
       this.enterResponsePhase();
-    } else if (action === "ASSASSINATE" && blockerId === this.state.targetId && role === "Contessa") {
-      this.state.blockerId = blockerId;
-      this.state.blockedRole = "Contessa";
+    } else if (action === "ASSASSINATE" && blockerId === this.targetId && role === "Contessa") {
+      this.blockerId = blockerId;
+      this.blockedRole = "Contessa";
       this.addLog(`${blocker.name} blokira Assassinate kao Contessa!`);
       this.enterResponsePhase();
-    } else if (action === "STEAL" && blockerId === this.state.targetId && (role === "Captain" || role === "Ambassador")) {
-      this.state.blockerId = blockerId;
-      this.state.blockedRole = role;
+    } else if (action === "STEAL" && blockerId === this.targetId && (role === "Captain" || role === "Ambassador")) {
+      this.blockerId = blockerId;
+      this.blockedRole = role;
       this.addLog(`${blocker.name} blokira krađu kao ${role}!`);
       this.enterResponsePhase();
     }
+    this.broadcastState();
   }
 
   handleChallenge(challengerId) {
-    const challenger = this.state.players.get(challengerId);
-    const isBlockerChallenged = this.state.blockerId !== "";
-    const accusedId = isBlockerChallenged ? this.state.blockerId : this.state.actorId;
-    const requiredRole = isBlockerChallenged ? this.state.blockedRole : this.state.claimedRole;
-    const accused = this.state.players.get(accusedId);
+    const challenger = this.players[challengerId];
+    const isBlockerChallenged = this.blockerId !== "";
+    const accusedId = isBlockerChallenged ? this.blockerId : this.actorId;
+    const requiredRole = isBlockerChallenged ? this.blockedRole : this.claimedRole;
+    const accused = this.players[accusedId];
 
     this.addLog(`${challenger.name} izaziva ${accused.name} ("Lažeš da imaš ${requiredRole}!")`);
-
     const cardIndex = accused.cards.findIndex(c => !c.revealed && c.role === requiredRole);
 
     if (cardIndex !== -1) {
@@ -298,7 +248,6 @@ class CoupRoom extends Room {
       this.deck.push(accused.cards[cardIndex].role);
       this.shuffleDeck();
       accused.cards[cardIndex].role = this.deck.pop();
-
       const nextStep = isBlockerChallenged ? "NEXT_TURN" : "RESOLVE_ACTION";
       this.triggerLoseInfluence(challengerId, nextStep);
     } else {
@@ -306,12 +255,13 @@ class CoupRoom extends Room {
       const nextStep = isBlockerChallenged ? "RESOLVE_ACTION" : "NEXT_TURN";
       this.triggerLoseInfluence(accusedId, nextStep);
     }
+    this.broadcastState();
   }
 
   resolveAction() {
-    const actor = this.state.players.get(this.state.actorId);
-    const target = this.state.targetId ? this.state.players.get(this.state.targetId) : null;
-    const action = this.state.pendingAction;
+    const actor = this.players[this.actorId];
+    const target = this.targetId ? this.players[this.targetId] : null;
+    const action = this.pendingAction;
 
     if (!actor || !actor.alive) {
       this.nextTurn();
@@ -347,17 +297,13 @@ class CoupRoom extends Room {
         if (!c.revealed) this.exchangePool.push(c.role);
       });
       this.exchangePool.push(this.deck.pop(), this.deck.pop());
-      this.state.phase = "EXCHANGE";
-      this.clients.forEach(c => {
-        if (c.sessionId === actor.id) {
-          c.send("exchange_options", { cards: this.exchangePool });
-        }
-      });
+      this.phase = "EXCHANGE";
+      this.sendTo(actor.id, { type: "exchange_options", cards: this.exchangePool });
     }
   }
 
   handleExchangeSelect(playerId, keepIndices) {
-    const player = this.state.players.get(playerId);
+    const player = this.players[playerId];
     const unrevealedCards = player.cards.filter(c => !c.revealed);
     if (!Array.isArray(keepIndices) || keepIndices.length !== unrevealedCards.length) return;
 
@@ -369,20 +315,19 @@ class CoupRoom extends Room {
 
     let k = 0;
     player.cards.forEach(c => {
-      if (!c.revealed) {
-        c.role = keptRoles[k++];
-      }
+      if (!c.revealed) c.role = keptRoles[k++];
     });
 
     this.addLog(`${player.name} je završio zamenu karata.`);
     this.nextTurn();
+    this.broadcastState();
   }
 
   triggerLoseInfluence(playerId, afterStep) {
-    const p = this.state.players.get(playerId);
+    const p = this.players[playerId];
     const unrevealed = p.cards.filter(c => !c.revealed);
     if (unrevealed.length <= 1) {
-      p.cards.forEach(c => c.revealed = true);
+      p.cards.forEach(c => (c.revealed = true));
       p.alive = false;
       this.addLog(`${p.name} je eliminisan iz igre!`);
       if (!this.checkWinCondition()) {
@@ -390,42 +335,34 @@ class CoupRoom extends Room {
         else this.nextTurn();
       }
     } else {
-      this.state.loserPlayerId = playerId;
-      this.state.loserReason = afterStep;
-      this.state.phase = "LOSE_INFLUENCE";
+      this.loserPlayerId = playerId;
+      this.loserReason = afterStep;
+      this.phase = "LOSE_INFLUENCE";
     }
   }
 
   handleLoseCard(playerId, cardIndex) {
-    const p = this.state.players.get(playerId);
+    const p = this.players[playerId];
     if (!p || !p.cards[cardIndex] || p.cards[cardIndex].revealed) return;
-
     p.cards[cardIndex].revealed = true;
     this.addLog(`${p.name} otkriva i gubi kartu: ${p.cards[cardIndex].role}.`);
-
-    const stillAlive = p.cards.some(c => !c.revealed);
-    if (!stillAlive) {
+    if (!p.cards.some(c => !c.revealed)) {
       p.alive = false;
       this.addLog(`${p.name} je eliminisan!`);
     }
-
     if (!this.checkWinCondition()) {
-      const nextStep = this.state.loserReason;
-      if (nextStep === "RESOLVE_ACTION") this.resolveAction();
+      if (this.loserReason === "RESOLVE_ACTION") this.resolveAction();
       else this.nextTurn();
     }
+    this.broadcastState();
   }
 
   checkWinCondition() {
-    const alivePlayers = [];
-    this.state.players.forEach(p => {
-      if (p.alive) alivePlayers.push(p);
-    });
-
+    const alivePlayers = Object.values(this.players).filter(p => p.alive);
     if (alivePlayers.length === 1) {
-      this.state.winnerName = alivePlayers[0].name;
-      this.state.phase = "GAME_OVER";
-      this.addLog(`🏆 POBEDNIK JE ${this.state.winnerName}!`);
+      this.winnerName = alivePlayers[0].name;
+      this.phase = "GAME_OVER";
+      this.addLog(`🏆 POBEDNIK JE ${this.winnerName}!`);
       return true;
     }
     return false;
@@ -434,39 +371,118 @@ class CoupRoom extends Room {
   nextTurn() {
     if (this.checkWinCondition()) return;
     this.resetPending();
-    const ids = Array.from(this.state.players.keys());
-    let currentIdx = ids.indexOf(this.state.turnPlayerId);
-
+    const ids = Object.keys(this.players);
+    let currentIdx = ids.indexOf(this.turnPlayerId);
     for (let i = 1; i <= ids.length; i++) {
       const nextId = ids[(currentIdx + i) % ids.length];
-      if (this.state.players.get(nextId).alive) {
-        this.state.turnPlayerId = nextId;
+      if (this.players[nextId].alive) {
+        this.turnPlayerId = nextId;
         break;
       }
     }
-    this.state.phase = "ACTION";
+    this.phase = "ACTION";
   }
 
   resetPending() {
-    this.state.pendingAction = "";
-    this.state.actorId = "";
-    this.state.targetId = "";
-    this.state.claimedRole = "";
-    this.state.blockerId = "";
-    this.state.blockedRole = "";
-    this.state.loserPlayerId = "";
-    this.state.loserReason = "";
+    this.pendingAction = "";
+    this.actorId = "";
+    this.targetId = "";
+    this.claimedRole = "";
+    this.blockerId = "";
+    this.blockedRole = "";
+    this.loserPlayerId = "";
+    this.loserReason = "";
+  }
+
+  getSanitizedState(viewerId) {
+    const maskedPlayers = {};
+    for (const [id, p] of Object.entries(this.players)) {
+      maskedPlayers[id] = {
+        id: p.id,
+        name: p.name,
+        coins: p.coins,
+        alive: p.alive,
+        cards: p.cards.map(c => ({
+          revealed: c.revealed,
+          role: c.revealed || id === viewerId ? c.role : "Tajna"
+        }))
+      };
+    }
+    return {
+      players: maskedPlayers,
+      phase: this.phase,
+      turnPlayerId: this.turnPlayerId,
+      logs: this.logs,
+      pendingAction: this.pendingAction,
+      actorId: this.actorId,
+      targetId: this.targetId,
+      claimedRole: this.claimedRole,
+      blockerId: this.blockerId,
+      blockedRole: this.blockedRole,
+      loserPlayerId: this.loserPlayerId,
+      winnerName: this.winnerName
+    };
+  }
+
+  broadcastState() {
+    this.broadcast();
   }
 }
 
-// --- POKRETANJE SERVERA ---
 const app = express();
 app.use(express.static(path.join(__dirname, "public")));
 
 const server = http.createServer(app);
-const gameServer = new Server({ server });
+const wss = new WebSocketServer({ noServer: true });
+const sockets = new Map();
+let nextClientId = 1;
 
-gameServer.define("coup_room", CoupRoom);
+const engine = new GameEngine(
+  () => {
+    for (const [id, socket] of sockets.entries()) {
+      if (socket.readyState === 1) {
+        socket.send(JSON.stringify({ type: "state", state: engine.getSanitizedState(id) }));
+      }
+    }
+  },
+  (targetId, payload) => {
+    const socket = sockets.get(targetId);
+    if (socket && socket.readyState === 1) {
+      socket.send(JSON.stringify(payload));
+    }
+  }
+);
+
+server.on("upgrade", (request, socket, head) => {
+  if (request.url && request.url.startsWith("/ws")) {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      const clientId = "p_" + nextClientId++;
+      const urlObj = new URL(request.url, "http://localhost");
+      const name = urlObj.searchParams.get("name") || "Igrač";
+
+      sockets.set(clientId, ws);
+      ws.send(JSON.stringify({ type: "welcome", id: clientId }));
+
+      if (!engine.addPlayer(clientId, name)) {
+        ws.close();
+        sockets.delete(clientId);
+        return;
+      }
+
+      ws.on("message", (raw) => {
+        try {
+          const data = JSON.parse(raw.toString());
+          engine.handleMessage(clientId, data);
+        } catch (e) {}
+      });
+
+      ws.on("close", () => {
+        sockets.delete(clientId);
+        engine.removePlayer(clientId);
+      });
+    });
+  }
+});
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
